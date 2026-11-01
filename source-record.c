@@ -37,6 +37,10 @@ struct source_record_filter_context {
 	obs_output_t *fileOutput;
 	obs_output_t *streamOutput;
 	obs_output_t *replayOutput;
+	/* a force stop was already requested for the current output */
+	bool fileStopRequested;
+	bool streamStopRequested;
+	bool replayStopRequested;
 	obs_encoder_t *encoder;
 	obs_encoder_t *audioEncoder[MAX_AUDIO_MIXES];
 	obs_service_t *service;
@@ -47,6 +51,10 @@ struct source_record_filter_context {
 	obs_hotkey_pair_id pauseHotkeys;
 	obs_hotkey_id splitHotkey;
 	obs_hotkey_id chapterHotkey;
+	obs_hotkey_id saveReplayHotkey;
+	/* guards replayOutput for readers on other threads (hotkey, websocket, mux) */
+	pthread_mutex_t replay_mutex;
+	volatile bool shutting_down;
 	int audio_track;
 	obs_weak_source_t *audio_source;
 	bool closing;
@@ -62,6 +70,15 @@ DARRAY(obs_source_t *) source_record_filters;
 
 static void *vendor;
 
+/* Set once OBS starts shutting down (OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN or
+ * OBS_FRONTEND_EVENT_EXIT). Shared by all filters. */
+static volatile bool plugin_exiting = false;
+
+/* Upper bound for waiting on an output to finish stopping. A stopping output
+ * normally finishes within one or two frames; the bound only prevents a stuck
+ * encoder from freezing OBS. */
+#define OUTPUT_STOP_TIMEOUT_MS 5000
+
 static void run_queued(obs_task_t task, void *param)
 {
 	if (obs_in_task_thread(OBS_TASK_UI) && obs_get_video()) {
@@ -69,6 +86,64 @@ static void run_queued(obs_task_t task, void *param)
 	} else {
 		obs_queue_task(OBS_TASK_UI, task, param, false);
 	}
+}
+
+/* Queued tasks must not hold a raw pointer to the filter context: the filter
+ * can be destroyed before the task runs. They hold a weak reference to the
+ * filter source instead and only touch the context while a strong reference
+ * keeps the filter alive. */
+typedef void (*context_task_t)(struct source_record_filter_context *context);
+
+struct context_task {
+	obs_weak_source_t *weak;
+	context_task_t func;
+};
+
+static void context_task_run(void *param)
+{
+	struct context_task *task = param;
+	obs_source_t *source = obs_weak_source_get_source(task->weak);
+	if (source) {
+		struct source_record_filter_context *context = obs_obj_get_data(source);
+		if (context)
+			task->func(context);
+		obs_source_release(source);
+	}
+	obs_weak_source_release(task->weak);
+	bfree(task);
+}
+
+/* takes ownership of weak */
+static void run_queued_weak(obs_weak_source_t *weak, context_task_t func)
+{
+	if (!weak)
+		return;
+	struct context_task *task = bzalloc(sizeof(struct context_task));
+	task->weak = weak;
+	task->func = func;
+	run_queued(context_task_run, task);
+}
+
+static void run_queued_context(struct source_record_filter_context *context, context_task_t func)
+{
+	run_queued_weak(obs_source_get_weak_source(context->source), func);
+}
+
+static void set_replay_output(struct source_record_filter_context *context, obs_output_t *output)
+{
+	pthread_mutex_lock(&context->replay_mutex);
+	context->replayOutput = output;
+	pthread_mutex_unlock(&context->replay_mutex);
+}
+
+/* Returns a new reference to the current replay output (or NULL). Use this
+ * from threads other than the one that creates/swaps the replay output. */
+static obs_output_t *get_replay_output_ref(struct source_record_filter_context *context)
+{
+	pthread_mutex_lock(&context->replay_mutex);
+	obs_output_t *output = obs_output_get_ref(context->replayOutput);
+	pthread_mutex_unlock(&context->replay_mutex);
+	return output;
 }
 
 static const char *source_record_filter_get_name(void *unused)
@@ -268,33 +343,38 @@ static const char *GetFormatExt(const char *format)
 	return format;
 }
 
-static void start_file_output_task(void *data)
+static void start_output_common(struct source_record_filter_context *context, obs_output_t *output)
 {
-	struct source_record_filter_context *context = data;
-	if (obs_output_start(context->fileOutput)) {
+	if (context->closing || !output)
+		return;
+	if (obs_output_start(output)) {
 		if (!context->output_active) {
 			context->output_active = true;
 			obs_source_inc_showing(obs_filter_get_parent(context->source));
 		}
 	}
+}
+
+static void start_file_output_task(struct source_record_filter_context *context)
+{
+	start_output_common(context, context->fileOutput);
 	context->starting_file_output = false;
 }
 
-static void start_stream_output_task(void *data)
+static void start_stream_output_task(struct source_record_filter_context *context)
 {
-	struct source_record_filter_context *context = data;
-	if (obs_output_start(context->streamOutput)) {
-		if (!context->output_active) {
-			context->output_active = true;
-			obs_source_inc_showing(obs_filter_get_parent(context->source));
-		}
-	}
+	start_output_common(context, context->streamOutput);
 	context->starting_stream_output = false;
 }
 
-static void release_encoders(void *param)
+static void start_replay_task(struct source_record_filter_context *context)
 {
-	struct source_record_filter_context *context = param;
+	start_output_common(context, context->replayOutput);
+	context->starting_replay_output = false;
+}
+
+static void release_encoders(struct source_record_filter_context *context)
+{
 	if (context->source && obs_source_enabled(context->source) && (context->replayBuffer || context->record || context->stream))
 		return;
 	if (context->encoder && !obs_encoder_active(context->encoder)) {
@@ -309,10 +389,19 @@ static void release_encoders(void *param)
 	}
 }
 
+/* An output that was detached from the filter and is stopped asynchronously.
+ * Holds only a weak reference to the filter, which may be gone by the time
+ * the output reports that it has stopped. */
 struct stop_output {
-	struct source_record_filter_context *context;
+	obs_weak_source_t *weak;
 	obs_output_t *output;
 };
+
+static void free_stop_output(struct stop_output *so)
+{
+	obs_weak_source_release(so->weak);
+	bfree(so);
+}
 
 static void source_record_replay_saved(void *data, calldata_t *cd)
 {
@@ -322,8 +411,9 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 
 	const char *path = calldata_string(cd, "path");
 	char *path_fallback = NULL;
-	if ((!path || !strlen(path)) && context->replayOutput) {
-		proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+	if (!path || !strlen(path)) {
+		obs_output_t *replay_output = get_replay_output_ref(context);
+		proc_handler_t *ph = replay_output ? obs_output_get_proc_handler(replay_output) : NULL;
 		if (ph) {
 			calldata_t proc_cd;
 			calldata_init(&proc_cd);
@@ -334,6 +424,7 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 			}
 			calldata_free(&proc_cd);
 		}
+		obs_output_release(replay_output);
 	}
 
 	const char *emit_path = "";
@@ -342,6 +433,8 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 	} else if (path_fallback) {
 		emit_path = path_fallback;
 	}
+
+	blog(LOG_INFO, "[Source Record] Replay buffer of '%s' saved to '%s'", obs_source_get_name(context->source), emit_path);
 
 	obs_data_t *event_data = obs_data_create();
 	obs_data_set_string(event_data, "path", emit_path);
@@ -357,46 +450,65 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 	bfree(path_fallback);
 }
 
+/* "stop" signal of a detached output; runs on the thread that ends the output */
 void release_output_stopped(void *data, calldata_t *cd)
 {
 	UNUSED_PARAMETER(cd);
 	struct stop_output *so = data;
-	if (!so->context->exiting)
+	/* During OBS shutdown queued UI tasks may never run or may run after
+	 * libobs is gone; the stopped output is freed by obs_shutdown() then. */
+	if (!os_atomic_load_bool(&plugin_exiting)) {
 		run_queued((obs_task_t)obs_output_release, so->output);
-	if (so->context->encoder || so->context->audioEncoder[0]) {
-		if (so->context->exiting || so->context->closing)
-			release_encoders(so->context);
-		else
-			run_queued(release_encoders, so->context);
+		run_queued_weak(so->weak, release_encoders);
+		so->weak = NULL; /* ownership moved to the queued task */
 	}
-	bfree(data);
+	free_stop_output(so);
 }
 
 static void force_stop_output_task(void *data)
 {
 	struct stop_output *so = data;
+
+	/* Never force-stop an output that is not active. obs_output_actual_stop()
+	 * resets the output's stopping_event, and for an inactive output nothing
+	 * signals it again. Every later obs_output_destroy() (for example the
+	 * one obs_shutdown() runs for leftover outputs) then waits on that
+	 * event forever, which freezes OBS. An inactive output can simply be
+	 * released. */
+	if (!obs_output_active(so->output)) {
+		obs_output_release(so->output);
+		run_queued_weak(so->weak, release_encoders);
+		so->weak = NULL;
+		free_stop_output(so);
+		return;
+	}
+
 	signal_handler_t *sh = obs_output_get_signal_handler(so->output);
 	if (sh) {
-		signal_handler_connect(sh, "stop", release_output_stopped, data);
-	}
-	obs_output_force_stop(so->output);
-	if (!sh) {
+		signal_handler_connect(sh, "stop", release_output_stopped, so);
+		obs_output_force_stop(so->output);
+	} else {
+		obs_output_force_stop(so->output);
 		obs_output_release(so->output);
-		release_encoders(so->context);
-		bfree(data);
+		run_queued_weak(so->weak, release_encoders);
+		so->weak = NULL;
+		free_stop_output(so);
 	}
 }
 
-static void start_replay_task(void *data)
+/* Detaches an output from the filter and stops + releases it asynchronously.
+ * The caller must clear its own pointer to the output. */
+static void queue_stop_output(struct source_record_filter_context *context, obs_output_t *output)
 {
-	struct source_record_filter_context *context = data;
-	if (obs_output_start(context->replayOutput)) {
-		if (!context->output_active) {
-			context->output_active = true;
-			obs_source_inc_showing(obs_filter_get_parent(context->source));
-		}
-	}
-	context->starting_replay_output = false;
+	if (!output)
+		return;
+	signal_handler_t *sh = obs_output_get_signal_handler(output);
+	if (sh)
+		signal_handler_disconnect(sh, "saved", source_record_replay_saved, context);
+	struct stop_output *so = bzalloc(sizeof(struct stop_output));
+	so->output = output;
+	so->weak = obs_source_get_weak_source(context->source);
+	run_queued(force_stop_output_task, so);
 }
 
 static void ensure_directory(char *path)
@@ -434,15 +546,64 @@ static void remove_filter(void *data, calldata_t *calldata)
 	obs_source_filter_remove(source, filter->source);
 }
 
-static void stop_output_sync(struct source_record_filter_context *context, obs_output_t *output)
+/* Requests a stop of an output that stays attached to the filter (closing
+ * paths). Never blocks. *stop_requested makes sure an output is force-stopped
+ * only once: a second force stop while the first one is completing can reset
+ * the output's stopping_event after it was signalled, after which destroying
+ * the output would wait forever. */
+static void stop_output_sync(struct source_record_filter_context *context, obs_output_t *output, bool *stop_requested)
 {
 	if (!output)
 		return;
 	signal_handler_t *sh = obs_output_get_signal_handler(output);
 	if (sh)
 		signal_handler_disconnect(sh, "stop", remove_filter, context);
-	if (obs_output_active(output))
+	if (!*stop_requested && obs_output_active(output)) {
+		*stop_requested = true;
 		obs_output_force_stop(output);
+	}
+}
+
+/* Bounded wait until an output is no longer active. Not usable on the graphics
+ * thread: a stopping replay buffer only finishes when its encoder delivers one
+ * more packet, and that needs the graphics thread to keep rendering. */
+static bool wait_for_output_stop(obs_output_t *output, uint32_t timeout_ms)
+{
+	if (!obs_output_active(output))
+		return true;
+	if (obs_in_task_thread(OBS_TASK_GRAPHICS))
+		return false;
+	const uint64_t deadline = os_gettime_ns() + (uint64_t)timeout_ms * 1000000ULL;
+	while (obs_output_active(output)) {
+		if (os_gettime_ns() >= deadline)
+			return false;
+		os_sleep_ms(5);
+	}
+	return true;
+}
+
+/* Disconnects the filter's signal handlers from an output, stops it if it is
+ * active and waits (bounded) for the stop to complete. Returns true when the
+ * output is stopped, so releasing the last reference will not block. */
+static bool stop_output_wait(struct source_record_filter_context *context, obs_output_t *output, bool *stop_requested,
+			     const char *kind)
+{
+	if (!output)
+		return true;
+	signal_handler_t *sh = obs_output_get_signal_handler(output);
+	if (sh) {
+		signal_handler_disconnect(sh, "stop", remove_filter, context);
+		signal_handler_disconnect(sh, "saved", source_record_replay_saved, context);
+	}
+	if (!*stop_requested && obs_output_active(output)) {
+		*stop_requested = true;
+		obs_output_force_stop(output);
+	}
+	if (wait_for_output_stop(output, OUTPUT_STOP_TIMEOUT_MS))
+		return true;
+	blog(LOG_WARNING, "[Source Record] %s output of '%s' did not stop within %d ms", kind,
+	     obs_source_get_name(context->source), OUTPUT_STOP_TIMEOUT_MS);
+	return false;
 }
 
 static const char *get_encoder_id(obs_data_t *settings)
@@ -544,6 +705,7 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 	if (!filter->fileOutput || strcmp(obs_output_get_id(filter->fileOutput), output_id) != 0) {
 		obs_output_release(filter->fileOutput);
 		filter->fileOutput = obs_output_create(output_id, obs_source_get_name(filter->source), s, NULL);
+		filter->fileStopRequested = false;
 		if (filter->remove_after_record) {
 			signal_handler_t *sh = obs_output_get_signal_handler(filter->fileOutput);
 			signal_handler_connect(sh, "stop", remove_filter, filter);
@@ -566,7 +728,7 @@ static void start_file_output(struct source_record_filter_context *filter, obs_d
 
 	filter->starting_file_output = true;
 
-	run_queued(start_file_output_task, filter);
+	run_queued_context(filter, start_file_output_task);
 }
 
 #define FTL_PROTOCOL "ftl"
@@ -628,6 +790,7 @@ static void start_stream_output(struct source_record_filter_context *filter, obs
 
 	if (!filter->streamOutput) {
 		filter->streamOutput = obs_output_create(type, obs_source_get_name(filter->source), settings, NULL);
+		filter->streamStopRequested = false;
 	} else {
 		obs_output_update(filter->streamOutput, settings);
 	}
@@ -647,7 +810,7 @@ static void start_stream_output(struct source_record_filter_context *filter, obs
 
 	filter->starting_stream_output = true;
 
-	run_queued(start_stream_output_task, filter);
+	run_queued_context(filter, start_stream_output_task);
 }
 
 static void start_replay_output(struct source_record_filter_context *filter, obs_data_t *settings)
@@ -673,7 +836,11 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 			dstr_init_copy(&name, obs_source_get_name(filter->source));
 		}
 
-		filter->replayOutput = obs_output_create("replay_buffer", name.array, s, hotkeys);
+		/* Since OBS 33 the replay_buffer output no longer registers a save
+		 * hotkey itself, so the legacy hotkey data is ignored there; it is
+		 * still passed for OBS 32 and older. */
+		set_replay_output(filter, obs_output_create("replay_buffer", name.array, s, hotkeys));
+		filter->replayStopRequested = false;
 		signal_handler_t *sh = obs_output_get_signal_handler(filter->replayOutput);
 		if (sh)
 			signal_handler_connect(sh, "saved", source_record_replay_saved, filter);
@@ -701,7 +868,7 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 
 	filter->starting_replay_output = true;
 
-	run_queued(start_replay_task, filter);
+	run_queued_context(filter, start_replay_task);
 }
 
 static void copy_defaults(obs_data_t *from, obs_data_t *to)
@@ -871,9 +1038,28 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 	filter->audio_track = audio_track;
 }
 
+/* Stores the hotkeys registered by the replay_buffer output itself (OBS 32 and
+ * older) in "replay_hotkeys". Since OBS 33 that output has no hotkeys and
+ * obs_hotkeys_save_output() returns NULL; the stored value is then left
+ * untouched instead of being overwritten with null, so the previous binding
+ * survives for the one-time migration and for downgrades. */
+static void save_legacy_replay_hotkeys(struct source_record_filter_context *filter, obs_data_t *settings)
+{
+	if (!filter->replayOutput)
+		return;
+	obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
+	if (!hotkeys)
+		return;
+	obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
+	obs_data_release(hotkeys);
+}
+
 static void source_record_filter_update(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
+	/* outputs are already torn down by source_record_shutdown() */
+	if (os_atomic_load_bool(&filter->shutting_down))
+		return;
 	obs_source_t *parent = obs_filter_get_parent(filter->source);
 	if (obs_obj_is_private(parent)) {
 		filter->closing = true;
@@ -953,12 +1139,9 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 				start_file_output(filter, settings);
 		} else if (filter->fileOutput) {
 			if (filter->closing) {
-				stop_output_sync(filter, filter->fileOutput);
+				stop_output_sync(filter, filter->fileOutput, &filter->fileStopRequested);
 			} else {
-				struct stop_output *so = bmalloc(sizeof(struct stop_output));
-				so->output = filter->fileOutput;
-				so->context = filter;
-				run_queued(force_stop_output_task, so);
+				queue_stop_output(filter, filter->fileOutput);
 				filter->fileOutput = NULL;
 			}
 		}
@@ -980,31 +1163,26 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			if (obs_source_enabled(filter->source) && filter->video_output)
 				start_replay_output(filter, settings);
 		} else if (filter->replayOutput) {
-			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
-			obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
-			obs_data_release(hotkeys);
+			save_legacy_replay_hotkeys(filter, settings);
 			if (filter->closing) {
-				stop_output_sync(filter, filter->replayOutput);
+				stop_output_sync(filter, filter->replayOutput, &filter->replayStopRequested);
 			} else {
-				struct stop_output *so = bmalloc(sizeof(struct stop_output));
-				so->output = filter->replayOutput;
-				so->context = filter;
-				run_queued(force_stop_output_task, so);
-				filter->replayOutput = NULL;
+				queue_stop_output(filter, filter->replayOutput);
+				set_replay_output(filter, NULL);
 			}
 		}
 
 		filter->replayBuffer = replay_buffer;
 	} else if (replay_buffer && filter->replayOutput && obs_source_enabled(filter->source)) {
 		if (filter->replay_buffer_duration != obs_data_get_int(settings, "replay_duration")) {
-			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
-			obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
-			obs_data_release(hotkeys);
-			struct stop_output *so = bmalloc(sizeof(struct stop_output));
-			so->output = filter->replayOutput;
-			so->context = filter;
-			run_queued(force_stop_output_task, so);
-			filter->replayOutput = NULL;
+			/* Restart with the new duration. The old output is detached
+			 * and stopped asynchronously (never force-stopped when it is
+			 * not active, see force_stop_output_task); the new output may
+			 * share the encoders with it while it winds down, which
+			 * libobs supports. */
+			save_legacy_replay_hotkeys(filter, settings);
+			queue_stop_output(filter, filter->replayOutput);
+			set_replay_output(filter, NULL);
 			start_replay_output(filter, settings);
 		}
 		obs_data_t *replay_settings = obs_output_get_settings(filter->replayOutput);
@@ -1044,12 +1222,9 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 				start_stream_output(filter, settings);
 		} else if (filter->streamOutput) {
 			if (filter->closing) {
-				stop_output_sync(filter, filter->streamOutput);
+				stop_output_sync(filter, filter->streamOutput, &filter->streamStopRequested);
 			} else {
-				struct stop_output *so = bmalloc(sizeof(struct stop_output));
-				so->output = filter->streamOutput;
-				so->context = filter;
-				run_queued(force_stop_output_task, so);
+				queue_stop_output(filter, filter->streamOutput);
 				filter->streamOutput = NULL;
 			}
 		}
@@ -1104,11 +1279,8 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 static void source_record_filter_save(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
-	if (filter->replayOutput) {
-		obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
-		obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
-		obs_data_release(hotkeys);
-	}
+	if (filter->replayOutput)
+		save_legacy_replay_hotkeys(filter, settings);
 }
 
 static void source_record_filter_defaults(obs_data_t *settings)
@@ -1162,10 +1334,130 @@ static void source_record_filter_defaults(obs_data_t *settings)
 
 static void source_record_filter_filter_remove(void *data, obs_source_t *parent);
 
-static void update_task(void *param)
+static void unregister_hotkeys(struct source_record_filter_context *context)
 {
-	struct source_record_filter_context *context = param;
-	obs_source_update(context->source, NULL);
+	/* After obs_hotkey_(pair_)unregister() returns, no callback for that
+	 * hotkey is running or will run anymore. */
+	if (context->enableHotkey != OBS_INVALID_HOTKEY_PAIR_ID)
+		obs_hotkey_pair_unregister(context->enableHotkey);
+	context->enableHotkey = OBS_INVALID_HOTKEY_PAIR_ID;
+
+	if (context->pauseHotkeys != OBS_INVALID_HOTKEY_PAIR_ID)
+		obs_hotkey_pair_unregister(context->pauseHotkeys);
+	context->pauseHotkeys = OBS_INVALID_HOTKEY_PAIR_ID;
+
+	if (context->splitHotkey != OBS_INVALID_HOTKEY_ID)
+		obs_hotkey_unregister(context->splitHotkey);
+	context->splitHotkey = OBS_INVALID_HOTKEY_ID;
+
+	if (context->chapterHotkey != OBS_INVALID_HOTKEY_ID)
+		obs_hotkey_unregister(context->chapterHotkey);
+	context->chapterHotkey = OBS_INVALID_HOTKEY_ID;
+
+	if (context->saveReplayHotkey != OBS_INVALID_HOTKEY_ID)
+		obs_hotkey_unregister(context->saveReplayHotkey);
+	context->saveReplayHotkey = OBS_INVALID_HOTKEY_ID;
+}
+
+static void release_idle_encoders(struct source_record_filter_context *context)
+{
+	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
+		if (!context->audioEncoder[i] || obs_encoder_active(context->audioEncoder[i]))
+			continue;
+		obs_encoder_release(context->audioEncoder[i]);
+		context->audioEncoder[i] = NULL;
+	}
+	if (context->encoder && !obs_encoder_active(context->encoder)) {
+		obs_encoder_release(context->encoder);
+		context->encoder = NULL;
+	}
+}
+
+static void frontend_event(enum obs_frontend_event event, void *data);
+
+static void graphics_barrier_task(void *param)
+{
+	UNUSED_PARAMETER(param);
+}
+
+/* Stops the filter's outputs while OBS's video and audio are still running and
+ * breaks the reference cycle filter view -> parent source -> filter.
+ *
+ * Called on the UI thread for OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN (the first
+ * event of OBS's exit sequence, before the scene data is cleared),
+ * OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP and OBS_FRONTEND_EVENT_EXIT.
+ *
+ * Without this, the private view keeps a reference to the parent source, so on
+ * exit neither the parent nor the filter is freed while the scene data is
+ * cleared. They are only freed by obs_shutdown() after it has stopped the video
+ * and audio threads and already destroyed all remaining outputs and encoders,
+ * leaving this filter with dangling output/encoder pointers, and a replay
+ * buffer that is still running can never finish stopping at that point.
+ *
+ * The context must not be touched after this function returns: clearing the
+ * view can release the last references to the parent and the filter. */
+static void source_record_shutdown(struct source_record_filter_context *context, bool exiting)
+{
+	if (os_atomic_load_bool(&context->shutting_down))
+		return;
+
+	obs_source_t *self = obs_source_get_ref(context->source);
+	if (!self)
+		return;
+
+	blog(LOG_INFO, "[Source Record] Stopping outputs of '%s' (%s)", obs_source_get_name(context->source),
+	     exiting ? "OBS is exiting" : "scene collection cleanup");
+
+	context->closing = true;
+	if (exiting)
+		context->exiting = true;
+	os_atomic_set_bool(&context->shutting_down, true);
+
+	/* video_tick and deferred updates run on the graphics thread. Let a
+	 * call that might already be running finish; later ones see
+	 * shutting_down/closing and return without touching the outputs. */
+	if (obs_get_video() && !obs_in_task_thread(OBS_TASK_GRAPHICS))
+		obs_queue_task(OBS_TASK_GRAPHICS, graphics_barrier_task, NULL, true);
+
+	unregister_hotkeys(context);
+
+	if (stop_output_wait(context, context->fileOutput, &context->fileStopRequested, "Recording")) {
+		obs_output_release(context->fileOutput);
+		context->fileOutput = NULL;
+	}
+	if (stop_output_wait(context, context->streamOutput, &context->streamStopRequested, "Stream")) {
+		obs_output_release(context->streamOutput);
+		context->streamOutput = NULL;
+	}
+	if (stop_output_wait(context, context->replayOutput, &context->replayStopRequested, "Replay buffer")) {
+		obs_output_t *replay_output = context->replayOutput;
+		set_replay_output(context, NULL);
+		obs_output_release(replay_output);
+	}
+	/* outputs that timed out keep their reference; destroy retries */
+
+	release_idle_encoders(context);
+
+	if (context->output_active) {
+		obs_source_t *parent = obs_filter_get_parent(context->source);
+		if (parent)
+			obs_source_dec_showing(parent);
+		context->output_active = false;
+	}
+
+	/* Removing the callback that is currently being executed is safe: the
+	 * frontend iterates the callbacks backwards by index. */
+	obs_frontend_remove_event_callback(frontend_event, context);
+
+	/* Break the reference cycle last. This may destroy the parent source
+	 * right here, which removes (and may queue destruction of) this filter;
+	 * self keeps the context valid until the release below. */
+	if (context->view) {
+		obs_view_set_source(context->view, SOURCE_CHANNEL, NULL);
+		obs_view_set_source(context->view, BACKGROUND_CHANNEL, NULL);
+	}
+
+	obs_source_release(self);
 }
 
 static void frontend_event(enum obs_frontend_event event, void *data)
@@ -1177,16 +1469,19 @@ static void frontend_event(enum obs_frontend_event event, void *data)
 	    event == OBS_FRONTEND_EVENT_RECORDING_STOPPING || event == OBS_FRONTEND_EVENT_RECORDING_STOPPED ||
 	    event == OBS_FRONTEND_EVENT_VIRTUALCAM_STARTED || event == OBS_FRONTEND_EVENT_VIRTUALCAM_STOPPED ||
 	    event == OBS_FRONTEND_EVENT_RECORDING_PAUSED || event == OBS_FRONTEND_EVENT_RECORDING_UNPAUSED) {
+		if (os_atomic_load_bool(&context->shutting_down))
+			return;
 		context->last_frontend_event = (int)event;
 
-		obs_queue_task(OBS_TASK_GRAPHICS, update_task, data, false);
+		/* The filter is a video source, so libobs defers the update to the
+		 * next video tick on the graphics thread. Calling it directly
+		 * avoids a queued task holding a raw context pointer. */
+		obs_source_update(context->source, NULL);
 	} else if (event == OBS_FRONTEND_EVENT_EXIT || event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN) {
-		context->closing = true;
-		context->exiting = true;
-		obs_source_update(context->source, NULL);
+		os_atomic_set_bool(&plugin_exiting, true);
+		source_record_shutdown(context, true);
 	} else if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP) {
-		context->closing = true;
-		obs_source_update(context->source, NULL);
+		source_record_shutdown(context, false);
 	}
 }
 
@@ -1194,6 +1489,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 {
 	struct source_record_filter_context *context = bzalloc(sizeof(struct source_record_filter_context));
 	context->source = source;
+	pthread_mutex_init(&context->replay_mutex, NULL);
 
 	da_push_back(source_record_filters, &source);
 	context->last_frontend_event = -1;
@@ -1201,6 +1497,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 	context->pauseHotkeys = OBS_INVALID_HOTKEY_PAIR_ID;
 	context->splitHotkey = OBS_INVALID_HOTKEY_ID;
 	context->chapterHotkey = OBS_INVALID_HOTKEY_ID;
+	context->saveReplayHotkey = OBS_INVALID_HOTKEY_ID;
 	source_record_filter_update(context, settings);
 	obs_frontend_add_event_callback(frontend_event, context);
 	return context;
@@ -1219,28 +1516,22 @@ static void source_record_filter_destroy(void *data)
 	}
 	obs_frontend_remove_event_callback(frontend_event, context);
 
-	stop_output_sync(context, context->fileOutput);
-	stop_output_sync(context, context->streamOutput);
-	stop_output_sync(context, context->replayOutput);
+	unregister_hotkeys(context);
 
-	if (context->enableHotkey != OBS_INVALID_HOTKEY_PAIR_ID)
-		obs_hotkey_pair_unregister(context->enableHotkey);
-
-	if (context->pauseHotkeys != OBS_INVALID_HOTKEY_PAIR_ID)
-		obs_hotkey_pair_unregister(context->pauseHotkeys);
-
-	if (context->splitHotkey != OBS_INVALID_HOTKEY_ID)
-		obs_hotkey_unregister(context->splitHotkey);
-
-	if (context->chapterHotkey != OBS_INVALID_HOTKEY_ID)
-		obs_hotkey_unregister(context->chapterHotkey);
+	/* Normally the outputs are gone already (source_record_shutdown or the
+	 * asynchronous stop path). Otherwise stop them with a bounded wait, while
+	 * the view still feeds the encoders, before releasing them. */
+	stop_output_wait(context, context->fileOutput, &context->fileStopRequested, "Recording");
+	stop_output_wait(context, context->streamOutput, &context->streamStopRequested, "Stream");
+	stop_output_wait(context, context->replayOutput, &context->replayStopRequested, "Replay buffer");
 
 	obs_output_release(context->fileOutput);
 	obs_output_release(context->streamOutput);
-	obs_output_release(context->replayOutput);
+	obs_output_t *replay_output = context->replayOutput;
+	set_replay_output(context, NULL);
+	obs_output_release(replay_output);
 	context->fileOutput = NULL;
 	context->streamOutput = NULL;
-	context->replayOutput = NULL;
 
 	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 		obs_encoder_release(context->audioEncoder[i]);
@@ -1271,6 +1562,7 @@ static void source_record_filter_destroy(void *data)
 	}
 
 	context->source = NULL;
+	pthread_mutex_destroy(&context->replay_mutex);
 	bfree(context);
 }
 
@@ -1307,7 +1599,7 @@ static bool source_record_pause_hotkey(void *data, obs_hotkey_pair_id id, obs_ho
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
 	struct source_record_filter_context *context = data;
-	if (!pressed)
+	if (!pressed || context->closing)
 		return false;
 
 	if (obs_output_paused(context->fileOutput))
@@ -1322,7 +1614,7 @@ static bool source_record_unpause_hotkey(void *data, obs_hotkey_pair_id id, obs_
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
 	struct source_record_filter_context *context = data;
-	if (!pressed)
+	if (!pressed || context->closing)
 		return false;
 	if (!obs_output_paused(context->fileOutput))
 		return false;
@@ -1338,7 +1630,7 @@ static void source_record_split_hotkey(void *data, obs_hotkey_id id, obs_hotkey_
 	if (!pressed)
 		return;
 	struct source_record_filter_context *context = data;
-	if (!context->fileOutput)
+	if (context->closing || !context->fileOutput)
 		return;
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
@@ -1354,7 +1646,7 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	if (!pressed)
 		return;
 	struct source_record_filter_context *context = data;
-	if (!context->fileOutput)
+	if (context->closing || !context->fileOutput)
 		return;
 	proc_handler_t *ph = obs_output_get_proc_handler(context->fileOutput);
 	struct calldata cd;
@@ -1363,11 +1655,92 @@ static void source_record_chapter_hotkey(void *data, obs_hotkey_id id, obs_hotke
 	calldata_free(&cd);
 }
 
+/* Saves the filter's own replay buffer. Registered by the plugin because since
+ * OBS 33 the replay_buffer output no longer registers a "Save Replay" hotkey,
+ * and OBS's own "Save Replay" hotkey (OBSBasic.SaveReplayBuffer) only saves
+ * the native replay buffer. Runs on the hotkey thread. */
+static void source_record_save_replay_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	if (!pressed)
+		return;
+	struct source_record_filter_context *context = data;
+	if (context->closing)
+		return;
+
+	obs_output_t *output = get_replay_output_ref(context);
+	if (!output || !obs_output_active(output)) {
+		blog(LOG_WARNING, "[Source Record] Save replay hotkey pressed, but the replay buffer of '%s' is not running",
+		     obs_source_get_name(context->source));
+		obs_output_release(output);
+		return;
+	}
+
+	blog(LOG_INFO, "[Source Record] Saving replay buffer of '%s' due to hotkey", obs_source_get_name(context->source));
+	proc_handler_t *ph = obs_output_get_proc_handler(output);
+	calldata_t cd = {0};
+	if (!proc_handler_call(ph, "save", &cd))
+		blog(LOG_WARNING, "[Source Record] Saving replay buffer of '%s' failed", obs_source_get_name(context->source));
+	calldata_free(&cd);
+	obs_output_release(output);
+}
+
+/* One-time migration of the binding that OBS 32 and older stored for the
+ * replay_buffer output's own hotkey ("replay_hotkeys" -> "ReplayBuffer.Save")
+ * to the new plugin hotkey. Runs only if the new hotkey has no binding yet.
+ * "replay_save_hotkey_migrated" makes sure a binding the user later removes on
+ * purpose is not restored again. The legacy data itself is kept. */
+static void migrate_legacy_replay_hotkey(struct source_record_filter_context *context)
+{
+	obs_data_t *settings = obs_source_get_settings(context->source);
+	if (!settings)
+		return;
+	if (!obs_data_get_bool(settings, "replay_save_hotkey_migrated")) {
+		obs_data_array_t *current = obs_hotkey_save(context->saveReplayHotkey);
+		if (!current || !obs_data_array_count(current)) {
+			obs_data_t *legacy = obs_data_get_obj(settings, "replay_hotkeys");
+			obs_data_array_t *bindings = legacy ? obs_data_get_array(legacy, "ReplayBuffer.Save") : NULL;
+			if (bindings && obs_data_array_count(bindings)) {
+				obs_hotkey_load(context->saveReplayHotkey, bindings);
+				blog(LOG_INFO, "[Source Record] Migrated %d save replay hotkey binding(s) of '%s' from OBS 32",
+				     (int)obs_data_array_count(bindings), obs_source_get_name(context->source));
+			}
+			obs_data_array_release(bindings);
+			obs_data_release(legacy);
+		}
+		obs_data_array_release(current);
+		obs_data_set_bool(settings, "replay_save_hotkey_migrated", true);
+	}
+	obs_data_release(settings);
+}
+
+static void register_save_replay_hotkey(struct source_record_filter_context *context, obs_source_t *parent)
+{
+	/* OBS 32 and older: the replay_buffer output has its own save hotkey
+	 * (loaded from "replay_hotkeys"); a second one would save twice. */
+	if (obs_get_version() < MAKE_SEMANTIC_VERSION(33, 0, 0))
+		return;
+
+	struct dstr description;
+	dstr_init(&description);
+	dstr_printf(&description, "%s (%s)", obs_module_text("SaveReplay"), obs_source_get_name(context->source));
+	/* Registered on the parent like the plugin's other hotkeys, so the binding
+	 * is stored with the parent source in the scene collection and shown
+	 * under it in Settings > Hotkeys. */
+	context->saveReplayHotkey = obs_hotkey_register_source(parent, "source_record.SaveReplay", description.array,
+							       source_record_save_replay_hotkey, context);
+	dstr_free(&description);
+
+	if (context->saveReplayHotkey != OBS_INVALID_HOTKEY_ID)
+		migrate_legacy_replay_hotkey(context);
+}
+
 static void source_record_filter_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
 	struct source_record_filter_context *context = data;
-	if (context->closing)
+	if (context->closing || os_atomic_load_bool(&context->shutting_down))
 		return;
 
 	obs_source_t *parent = obs_filter_get_parent(context->source);
@@ -1400,6 +1773,9 @@ static void source_record_filter_tick(void *data, float seconds)
 		context->chapterHotkey = obs_hotkey_register_source(parent, "source_record.AddChapterMarker",
 								    obs_frontend_get_locale_string("Basic.Main.AddChapterMarker"),
 								    source_record_chapter_hotkey, context);
+
+	if (context->saveReplayHotkey == OBS_INVALID_HOTKEY_ID)
+		register_save_replay_hotkey(context, parent);
 
 	uint32_t width = obs_source_get_width(parent);
 	width += (width & 1);
@@ -1456,25 +1832,16 @@ static void source_record_filter_tick(void *data, float seconds)
 
 	if (context->restart && context->output_active) {
 		if (context->fileOutput) {
-			struct stop_output *so = bmalloc(sizeof(struct stop_output));
-			so->output = context->fileOutput;
-			so->context = context;
-			run_queued(force_stop_output_task, so);
+			queue_stop_output(context, context->fileOutput);
 			context->fileOutput = NULL;
 		}
 		if (context->streamOutput) {
-			struct stop_output *so = bmalloc(sizeof(struct stop_output));
-			so->output = context->streamOutput;
-			so->context = context;
-			run_queued(force_stop_output_task, so);
+			queue_stop_output(context, context->streamOutput);
 			context->streamOutput = NULL;
 		}
 		if (context->replayOutput) {
-			struct stop_output *so = bmalloc(sizeof(struct stop_output));
-			so->output = context->replayOutput;
-			so->context = context;
-			run_queued(force_stop_output_task, so);
-			context->replayOutput = NULL;
+			queue_stop_output(context, context->replayOutput);
+			set_replay_output(context, NULL);
 		}
 		context->output_active = false;
 		context->restart = false;
@@ -1523,25 +1890,16 @@ static void source_record_filter_tick(void *data, float seconds)
 		obs_data_release(s);
 	} else if (context->output_active && !obs_source_enabled(context->source)) {
 		if (context->fileOutput) {
-			struct stop_output *so = bmalloc(sizeof(struct stop_output));
-			so->output = context->fileOutput;
-			so->context = context;
-			run_queued(force_stop_output_task, so);
+			queue_stop_output(context, context->fileOutput);
 			context->fileOutput = NULL;
 		}
 		if (context->streamOutput) {
-			struct stop_output *so = bmalloc(sizeof(struct stop_output));
-			so->output = context->streamOutput;
-			so->context = context;
-			run_queued(force_stop_output_task, so);
+			queue_stop_output(context, context->streamOutput);
 			context->streamOutput = NULL;
 		}
 		if (context->replayOutput) {
-			struct stop_output *so = bmalloc(sizeof(struct stop_output));
-			so->output = context->replayOutput;
-			so->context = context;
-			run_queued(force_stop_output_task, so);
-			context->replayOutput = NULL;
+			queue_stop_output(context, context->replayOutput);
+			set_replay_output(context, NULL);
 		}
 		context->output_active = false;
 		obs_source_dec_showing(obs_filter_get_parent(context->source));
@@ -1899,9 +2257,9 @@ static void source_record_filter_filter_remove(void *data, obs_source_t *parent)
 	UNUSED_PARAMETER(parent);
 	struct source_record_filter_context *context = data;
 	context->closing = true;
-	stop_output_sync(context, context->fileOutput);
-	stop_output_sync(context, context->streamOutput);
-	stop_output_sync(context, context->replayOutput);
+	stop_output_sync(context, context->fileOutput, &context->fileStopRequested);
+	stop_output_sync(context, context->streamOutput, &context->streamStopRequested);
+	stop_output_sync(context, context->replayOutput, &context->replayStopRequested);
 	obs_frontend_remove_event_callback(frontend_event, context);
 }
 
@@ -2378,16 +2736,18 @@ static bool save_replay_buffer_source(obs_source_t *source, obs_data_t *request_
 	if (!filter)
 		return false;
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	if (!context->replayOutput) {
+	obs_output_t *replay_output = context ? get_replay_output_ref(context) : NULL;
+	if (!replay_output) {
 		blog(LOG_WARNING, "[Source Record] replay_buffer_save requested but replay output is not active");
 		obs_source_release(filter);
 		return false;
 	}
 
-	proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+	proc_handler_t *ph = obs_output_get_proc_handler(replay_output);
 	calldata_t cd = {0};
 	bool success = proc_handler_call(ph, "save", &cd);
 	calldata_free(&cd);
+	obs_output_release(replay_output);
 	if (!success)
 		blog(LOG_WARNING, "[Source Record] replay_buffer_save proc call failed");
 	else
