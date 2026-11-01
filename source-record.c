@@ -41,6 +41,8 @@ struct source_record_filter_context {
 	bool fileStopRequested;
 	bool streamStopRequested;
 	bool replayStopRequested;
+	/* replay output to be started once the encoder is free (see start_or_defer_replay_output) */
+	bool replay_start_pending;
 	obs_encoder_t *encoder;
 	obs_encoder_t *audioEncoder[MAX_AUDIO_MIXES];
 	obs_service_t *service;
@@ -584,9 +586,12 @@ static bool wait_for_output_stop(obs_output_t *output, uint32_t timeout_ms)
 
 /* Disconnects the filter's signal handlers from an output, stops it if it is
  * active and waits (bounded) for the stop to complete. Returns true when the
- * output is stopped, so releasing the last reference will not block. */
+ * output is stopped, so releasing the last reference will not block.
+ * graceful uses obs_output_stop(): data up to "now" is still processed, so a
+ * replay save requested just before is still written (a force stop discards
+ * the pending save). */
 static bool stop_output_wait(struct source_record_filter_context *context, obs_output_t *output, bool *stop_requested,
-			     const char *kind)
+			     const char *kind, bool graceful)
 {
 	if (!output)
 		return true;
@@ -597,12 +602,15 @@ static bool stop_output_wait(struct source_record_filter_context *context, obs_o
 	}
 	if (!*stop_requested && obs_output_active(output)) {
 		*stop_requested = true;
-		obs_output_force_stop(output);
+		if (graceful)
+			obs_output_stop(output);
+		else
+			obs_output_force_stop(output);
 	}
 	if (wait_for_output_stop(output, OUTPUT_STOP_TIMEOUT_MS))
 		return true;
-	blog(LOG_WARNING, "[Source Record] %s output of '%s' did not stop within %d ms", kind,
-	     obs_source_get_name(context->source), OUTPUT_STOP_TIMEOUT_MS);
+	blog(LOG_WARNING, "[Source Record] %s output of '%s' did not stop within %d ms", kind, obs_source_get_name(context->source),
+	     OUTPUT_STOP_TIMEOUT_MS);
 	return false;
 }
 
@@ -869,6 +877,34 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 	filter->starting_replay_output = true;
 
 	run_queued_context(filter, start_replay_task);
+}
+
+/* A replay buffer that joins an encoder which is still running for another
+ * output only gets packets from the encoder's next keyframe on, which can be
+ * many seconds away; until then it records nothing and cannot finish stopping.
+ * When the encoder is only still busy because a previous (detached) output is
+ * winding down, start the new replay output from video_tick once the encoder
+ * is idle, so it starts with a fresh keyframe. If the filter's own recording or
+ * stream output keeps the encoder running, sharing it is unavoidable. */
+static bool encoder_busy_with_detached_output(struct source_record_filter_context *filter)
+{
+	if (!filter->encoder || !obs_encoder_active(filter->encoder))
+		return false;
+	if (filter->fileOutput && obs_output_active(filter->fileOutput))
+		return false;
+	if (filter->streamOutput && obs_output_active(filter->streamOutput))
+		return false;
+	return true;
+}
+
+static void start_or_defer_replay_output(struct source_record_filter_context *filter, obs_data_t *settings)
+{
+	if (!filter->replayOutput && encoder_busy_with_detached_output(filter)) {
+		filter->replay_start_pending = true;
+		return;
+	}
+	filter->replay_start_pending = false;
+	start_replay_output(filter, settings);
 }
 
 static void copy_defaults(obs_data_t *from, obs_data_t *to)
@@ -1161,8 +1197,11 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 	if (replay_buffer != filter->replayBuffer) {
 		if (replay_buffer) {
 			if (obs_source_enabled(filter->source) && filter->video_output)
-				start_replay_output(filter, settings);
-		} else if (filter->replayOutput) {
+				start_or_defer_replay_output(filter, settings);
+		} else {
+			filter->replay_start_pending = false;
+		}
+		if (!replay_buffer && filter->replayOutput) {
 			save_legacy_replay_hotkeys(filter, settings);
 			if (filter->closing) {
 				stop_output_sync(filter, filter->replayOutput, &filter->replayStopRequested);
@@ -1176,18 +1215,19 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 	} else if (replay_buffer && filter->replayOutput && obs_source_enabled(filter->source)) {
 		if (filter->replay_buffer_duration != obs_data_get_int(settings, "replay_duration")) {
 			/* Restart with the new duration. The old output is detached
-			 * and stopped asynchronously (never force-stopped when it is
-			 * not active, see force_stop_output_task); the new output may
-			 * share the encoders with it while it winds down, which
-			 * libobs supports. */
+			 * and stopped asynchronously; the new one is started once
+			 * the old one has released the encoder (see
+			 * start_or_defer_replay_output). */
 			save_legacy_replay_hotkeys(filter, settings);
 			queue_stop_output(filter, filter->replayOutput);
 			set_replay_output(filter, NULL);
-			start_replay_output(filter, settings);
+			start_or_defer_replay_output(filter, settings);
 		}
-		obs_data_t *replay_settings = obs_output_get_settings(filter->replayOutput);
-		obs_data_set_string(replay_settings, "format", obs_data_get_string(settings, "replay_filename_formatting"));
-		obs_data_release(replay_settings);
+		if (filter->replayOutput) {
+			obs_data_t *replay_settings = obs_output_get_settings(filter->replayOutput);
+			obs_data_set_string(replay_settings, "format", obs_data_get_string(settings, "replay_filename_formatting"));
+			obs_data_release(replay_settings);
+		}
 	}
 
 	bool stream = false;
@@ -1421,15 +1461,15 @@ static void source_record_shutdown(struct source_record_filter_context *context,
 
 	unregister_hotkeys(context);
 
-	if (stop_output_wait(context, context->fileOutput, &context->fileStopRequested, "Recording")) {
+	if (stop_output_wait(context, context->fileOutput, &context->fileStopRequested, "Recording", true)) {
 		obs_output_release(context->fileOutput);
 		context->fileOutput = NULL;
 	}
-	if (stop_output_wait(context, context->streamOutput, &context->streamStopRequested, "Stream")) {
+	if (stop_output_wait(context, context->streamOutput, &context->streamStopRequested, "Stream", true)) {
 		obs_output_release(context->streamOutput);
 		context->streamOutput = NULL;
 	}
-	if (stop_output_wait(context, context->replayOutput, &context->replayStopRequested, "Replay buffer")) {
+	if (stop_output_wait(context, context->replayOutput, &context->replayStopRequested, "Replay buffer", true)) {
 		obs_output_t *replay_output = context->replayOutput;
 		set_replay_output(context, NULL);
 		obs_output_release(replay_output);
@@ -1521,9 +1561,9 @@ static void source_record_filter_destroy(void *data)
 	/* Normally the outputs are gone already (source_record_shutdown or the
 	 * asynchronous stop path). Otherwise stop them with a bounded wait, while
 	 * the view still feeds the encoders, before releasing them. */
-	stop_output_wait(context, context->fileOutput, &context->fileStopRequested, "Recording");
-	stop_output_wait(context, context->streamOutput, &context->streamStopRequested, "Stream");
-	stop_output_wait(context, context->replayOutput, &context->replayStopRequested, "Replay buffer");
+	stop_output_wait(context, context->fileOutput, &context->fileStopRequested, "Recording", false);
+	stop_output_wait(context, context->streamOutput, &context->streamStopRequested, "Stream", false);
+	stop_output_wait(context, context->replayOutput, &context->replayStopRequested, "Replay buffer", false);
 
 	obs_output_release(context->fileOutput);
 	obs_output_release(context->streamOutput);
@@ -1828,6 +1868,19 @@ static void source_record_filter_tick(void *data, float seconds)
 			}
 		}
 		/* else: encoder still winding down, retry on the next tick */
+	}
+
+	/* deferred replay start, see start_or_defer_replay_output() */
+	if (context->replay_start_pending) {
+		if (!context->replayBuffer || !obs_source_enabled(context->source) || context->replayOutput || context->restart) {
+			context->replay_start_pending = false;
+		} else if (context->video_output && !encoder_busy_with_detached_output(context)) {
+			obs_data_t *s = obs_source_get_settings(context->source);
+			context->replay_start_pending = false;
+			update_encoder(context, s);
+			start_replay_output(context, s);
+			obs_data_release(s);
+		}
 	}
 
 	if (context->restart && context->output_active) {
