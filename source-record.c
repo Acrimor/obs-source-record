@@ -47,6 +47,9 @@ struct source_record_filter_context {
 	obs_output_t *fileOutput;
 	obs_output_t *streamOutput;
 	obs_output_t *replayOutput;
+	/* protects the output pointers for readers on other threads (hotkey,
+	 * websocket, replay buffer "saved" signal) */
+	pthread_mutex_t outputs_mutex;
 	obs_encoder_t *encoder;
 	obs_encoder_t *audioEncoder[MAX_AUDIO_MIXES];
 	obs_service_t *service;
@@ -81,6 +84,17 @@ static void run_queued(obs_task_t task, void *param)
 	} else {
 		obs_queue_task(OBS_TASK_UI, task, param, false);
 	}
+}
+
+/* Returns a new reference to the replay output, or NULL. Use this instead of
+ * reading replayOutput directly from threads other than the graphics thread,
+ * because a stop thread may release the output at any time. */
+static obs_output_t *get_replay_output(struct source_record_filter_context *context)
+{
+	pthread_mutex_lock(&context->outputs_mutex);
+	obs_output_t *output = obs_output_get_ref(context->replayOutput);
+	pthread_mutex_unlock(&context->outputs_mutex);
+	return output;
 }
 
 static const char *source_record_filter_get_name(void *unused)
@@ -345,8 +359,9 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 
 	const char *path = calldata_string(cd, "path");
 	char *path_fallback = NULL;
-	if ((!path || !strlen(path)) && context->replayOutput) {
-		proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+	obs_output_t *replay_output = (!path || !strlen(path)) ? get_replay_output(context) : NULL;
+	if (replay_output) {
+		proc_handler_t *ph = obs_output_get_proc_handler(replay_output);
 		if (ph) {
 			calldata_t proc_cd;
 			calldata_init(&proc_cd);
@@ -357,6 +372,7 @@ static void source_record_replay_saved(void *data, calldata_t *cd)
 			}
 			calldata_free(&proc_cd);
 		}
+		obs_output_release(replay_output);
 	}
 
 	const char *emit_path = "";
@@ -457,8 +473,10 @@ static void stop_output_async(struct source_record_filter_context *context, obs_
 	if (!p_output || !*p_output)
 		return;
 
+	pthread_mutex_lock(&context->outputs_mutex);
 	obs_output_t *output = *p_output;
 	*p_output = NULL;
+	pthread_mutex_unlock(&context->outputs_mutex);
 
 	if (type == OUTPUT_TYPE_FILE)
 		context->stopping_file_output = true;
@@ -1017,7 +1035,10 @@ static void start_replay_output(struct source_record_filter_context *filter, obs
 			dstr_init_copy(&name, obs_source_get_name(filter->source));
 		}
 
-		filter->replayOutput = obs_output_create("replay_buffer", name.array, s, hotkeys);
+		obs_output_t *replay_output = obs_output_create("replay_buffer", name.array, s, hotkeys);
+		pthread_mutex_lock(&filter->outputs_mutex);
+		filter->replayOutput = replay_output;
+		pthread_mutex_unlock(&filter->outputs_mutex);
 		signal_handler_t *sh = obs_output_get_signal_handler(filter->replayOutput);
 		if (sh)
 			signal_handler_connect(sh, "saved", source_record_replay_saved, filter);
@@ -1684,6 +1705,7 @@ static void *source_record_filter_create(obs_data_t *settings, obs_source_t *sou
 {
 	struct source_record_filter_context *context = bzalloc(sizeof(struct source_record_filter_context));
 	context->source = source;
+	pthread_mutex_init(&context->outputs_mutex, NULL);
 
 	da_push_back(source_record_filters, &source);
 	context->last_frontend_event = -1;
@@ -1735,10 +1757,13 @@ static void source_record_filter_destroy(void *data)
 
 	obs_output_release(context->fileOutput);
 	obs_output_release(context->streamOutput);
-	obs_output_release(context->replayOutput);
+	pthread_mutex_lock(&context->outputs_mutex);
+	obs_output_t *replay_output = context->replayOutput;
+	context->replayOutput = NULL;
+	pthread_mutex_unlock(&context->outputs_mutex);
+	obs_output_release(replay_output);
 	context->fileOutput = NULL;
 	context->streamOutput = NULL;
-	context->replayOutput = NULL;
 
 	for (int i = 0; i < MAX_AUDIO_MIXES; i++) {
 		obs_encoder_release(context->audioEncoder[i]);
@@ -1769,6 +1794,7 @@ static void source_record_filter_destroy(void *data)
 	}
 
 	context->source = NULL;
+	pthread_mutex_destroy(&context->outputs_mutex);
 	bfree(context);
 }
 
@@ -1868,13 +1894,15 @@ static void source_record_replay_hotkey(void *data, obs_hotkey_id id, obs_hotkey
 	if (!pressed)
 		return;
 	struct source_record_filter_context *context = data;
-	if (!context->replayOutput)
+	obs_output_t *output = get_replay_output(context);
+	if (!output)
 		return;
-	proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+	proc_handler_t *ph = obs_output_get_proc_handler(output);
 	struct calldata cd;
 	calldata_init(&cd);
 	proc_handler_call(ph, "save", &cd);
 	calldata_free(&cd);
+	obs_output_release(output);
 }
 
 static void source_record_filter_tick(void *data, float seconds)
@@ -3012,16 +3040,18 @@ static bool save_replay_buffer_source(obs_source_t *source, obs_data_t *request_
 	if (!filter)
 		return false;
 	struct source_record_filter_context *context = obs_obj_get_data(filter);
-	if (!context->replayOutput) {
+	obs_output_t *replay_output = context ? get_replay_output(context) : NULL;
+	if (!replay_output) {
 		blog(LOG_WARNING, "[Source Record] replay_buffer_save requested but replay output is not active");
 		obs_source_release(filter);
 		return false;
 	}
 
-	proc_handler_t *ph = obs_output_get_proc_handler(context->replayOutput);
+	proc_handler_t *ph = obs_output_get_proc_handler(replay_output);
 	calldata_t cd = {0};
 	bool success = proc_handler_call(ph, "save", &cd);
 	calldata_free(&cd);
+	obs_output_release(replay_output);
 	if (!success)
 		blog(LOG_WARNING, "[Source Record] replay_buffer_save proc call failed");
 	else
