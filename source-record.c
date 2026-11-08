@@ -540,6 +540,11 @@ static void stop_output_sync(struct source_record_filter_context *context, obs_o
 		signal_handler_disconnect(sh, "stop", remove_filter, context);
 	if (obs_output_active(output)) {
 		obs_output_force_stop(output);
+		/* A replay buffer only finishes stopping when its encoder delivers
+		 * another packet, which needs the graphics thread to render the next
+		 * frame. Waiting here on the graphics thread can never succeed. */
+		if (obs_in_task_thread(OBS_TASK_GRAPHICS))
+			return;
 		uint64_t start_time = os_gettime_ns();
 		while (obs_output_active(output)) {
 			os_sleep_ms(10);
@@ -549,6 +554,17 @@ static void stop_output_sync(struct source_record_filter_context *context, obs_o
 			}
 		}
 	}
+}
+
+/* Stops an output from a closing path without blocking the calling thread,
+ * which is usually the graphics thread (deferred update). The stop thread can
+ * wait for the output while rendering continues; destroy waits for it. */
+static void stop_output_closing(struct source_record_filter_context *context, obs_output_t **p_output, enum output_type type)
+{
+	signal_handler_t *sh = obs_output_get_signal_handler(*p_output);
+	if (sh)
+		signal_handler_disconnect(sh, "stop", remove_filter, context);
+	stop_output_async(context, p_output, type);
 }
 
 static const char *get_encoder_id(obs_data_t *settings)
@@ -1378,13 +1394,10 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			if (obs_source_enabled(filter->source) && filter->video_output)
 				start_file_output(filter, settings);
 		} else if (filter->fileOutput) {
-			if (filter->closing) {
-				stop_output_sync(filter, filter->fileOutput);
-				obs_output_release(filter->fileOutput);
-				filter->fileOutput = NULL;
-			} else {
+			if (filter->closing)
+				stop_output_closing(filter, &filter->fileOutput, OUTPUT_TYPE_FILE);
+			else
 				stop_output_async(filter, &filter->fileOutput, OUTPUT_TYPE_FILE);
-			}
 		}
 		filter->record = record;
 		if (!record && !filter->stream && !filter->replayBuffer &&
@@ -1415,13 +1428,10 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
 			obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
 			obs_data_release(hotkeys);
-			if (filter->closing) {
-				stop_output_sync(filter, filter->replayOutput);
-				obs_output_release(filter->replayOutput);
-				filter->replayOutput = NULL;
-			} else {
+			if (filter->closing)
+				stop_output_closing(filter, &filter->replayOutput, OUTPUT_TYPE_REPLAY);
+			else
 				stop_output_async(filter, &filter->replayOutput, OUTPUT_TYPE_REPLAY);
-			}
 		}
 
 		filter->replayBuffer = replay_buffer;
@@ -1449,13 +1459,10 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			if (obs_source_enabled(filter->source) && filter->video_output)
 				start_stream_output(filter, settings);
 		} else if (filter->streamOutput) {
-			if (filter->closing) {
-				stop_output_sync(filter, filter->streamOutput);
-				obs_output_release(filter->streamOutput);
-				filter->streamOutput = NULL;
-			} else {
+			if (filter->closing)
+				stop_output_closing(filter, &filter->streamOutput, OUTPUT_TYPE_STREAM);
+			else
 				stop_output_async(filter, &filter->streamOutput, OUTPUT_TYPE_STREAM);
-			}
 		}
 		filter->stream = stream;
 	}
@@ -2423,7 +2430,10 @@ static void source_record_filter_filter_remove(void *data, obs_source_t *parent)
 	stop_output_sync(context, context->fileOutput);
 	stop_output_sync(context, context->streamOutput);
 	stop_output_sync(context, context->replayOutput);
-	while (os_atomic_load_long(&context->active_stop_threads) > 0) {
+	/* filter_remove can run on the graphics thread (e.g. when a view releases
+	 * a removed parent). The stop threads need rendering to continue, so only
+	 * wait for them elsewhere; destroy waits for them in any case. */
+	while (!obs_in_task_thread(OBS_TASK_GRAPHICS) && os_atomic_load_long(&context->active_stop_threads) > 0) {
 		os_sleep_ms(10);
 	}
 	obs_frontend_remove_event_callback(frontend_event, context);
