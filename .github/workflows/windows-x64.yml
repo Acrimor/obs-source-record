@@ -1,0 +1,182 @@
+name: Windows x64 package (OBS 33)
+
+# Builds source-record.dll for Windows x64 and packages it in the plugin
+# layout OBS 33 loads from C:\ProgramData\obs-studio\plugins.
+#
+# The build itself is the in-tree build of the existing "build obs plugin"
+# workflow (OBS 29.0.0-beta1 sources and dependencies, Visual Studio 2022),
+# which last succeeded upstream for commit 9b5fe68. A plugin built against
+# older libobs headers loads in newer OBS versions; the api-check job below
+# additionally compiles the plugin source against the OBS 33.0.1 headers.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'claude/**'
+    paths:
+      - 'source-record.c'
+      - 'source-record.h'
+      - 'obs-websocket-api.h'
+      - 'CMakeLists.txt'
+      - 'version.h.in'
+      - 'resource.rc.in'
+      - 'data/**'
+      - '.github/workflows/windows-x64.yml'
+
+permissions:
+  contents: read
+
+env:
+  PLUGIN_NAME: source-record
+  OBS_BUILD_VERSION: 29.0.0-beta1
+  OBS_API_CHECK_VERSION: 33.0.1
+
+jobs:
+  api-check:
+    name: Compile check against OBS headers
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - obs: 29.0.0-beta1
+            frontend_api: UI/obs-frontend-api
+          - obs: 33.0.1
+            frontend_api: frontend/api
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4.1.1
+        with:
+          path: plugin
+
+      - name: Checkout OBS ${{ matrix.obs }} headers
+        uses: actions/checkout@v4.1.1
+        with:
+          repository: obsproject/obs-studio
+          ref: ${{ matrix.obs }}
+          path: obs-studio
+          sparse-checkout: |
+            libobs
+            ${{ matrix.frontend_api }}
+
+      - name: Install compiler and SIMDe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc clang libsimde-dev
+
+      - name: Compile (syntax and warnings)
+        shell: bash
+        run: |
+          set -euo pipefail
+          inc="${RUNNER_TEMP}/inc"
+          mkdir -p "${inc}"
+          cp obs-studio/${{ matrix.frontend_api }}/obs-frontend-api.h "${inc}/"
+          printf '#pragma once\n#define OBS_DATA_PATH ""\n#define OBS_PLUGIN_PATH ""\n#define OBS_PLUGIN_DESTINATION ""\n#define OBS_RELEASE_CANDIDATE 0\n#define OBS_BETA 0\n#define OBS_VERSION "ci"\n#define OBS_INSTALL_PREFIX ""\n' > "${inc}/obsconfig.h"
+          sed 's/\${PROJECT_VERSION}/ci/; s/\${PROJECT_VERSION_MAJOR}/0/; s/\${PROJECT_VERSION_MINOR}/0/; s/\${PROJECT_VERSION_PATCH}/0/' plugin/version.h.in > "${inc}/version.h"
+          for cc in gcc clang; do
+            echo "::group::${cc}"
+            ${cc} -fsyntax-only -std=gnu11 -Wall -Wextra -Werror \
+              -Wno-unused-parameter -Wno-missing-field-initializers -Wno-deprecated-declarations \
+              -I"${inc}" -Iobs-studio/libobs -Iplugin plugin/source-record.c
+            echo "::endgroup::"
+          done
+
+  windows-x64:
+    name: Windows x64 build and package
+    runs-on: windows-2022
+    env:
+      CMAKE_GENERATOR: 'Visual Studio 17 2022'
+      CMAKE_SYSTEM_VERSION: '10.0.18363.657'
+      WINDOWS_DEPS_VERSION: '2022-08-02'
+    steps:
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Checkout OBS ${{ env.OBS_BUILD_VERSION }}
+        uses: actions/checkout@v4.1.1
+        with:
+          repository: obsproject/obs-studio
+          ref: ${{ env.OBS_BUILD_VERSION }}
+          submodules: 'recursive'
+
+      - name: Checkout plugin
+        uses: actions/checkout@v4.1.1
+        with:
+          path: plugins/${{ env.PLUGIN_NAME }}
+
+      - name: Add plugin to OBS CMake
+        shell: cmd
+        run: echo add_subdirectory(${{ env.PLUGIN_NAME }}) > plugins/CMakeLists.txt
+
+      - name: Fetch Git tags
+        run: git fetch --prune --tags --unshallow
+
+      - name: 'Install prerequisite: Qt'
+        run: |
+          curl -kLO https://github.com/obsproject/obs-deps/releases/download/${{ env.WINDOWS_DEPS_VERSION }}/windows-deps-qt6-${{ env.WINDOWS_DEPS_VERSION }}-x64.zip -f --retry 5 -C -
+          7z x windows-deps-qt6-${{ env.WINDOWS_DEPS_VERSION }}-x64.zip -o"${{ github.workspace }}/cmbuild/deps"
+
+      - name: 'Install prerequisite: pre-built dependencies'
+        run: |
+          curl -kLO https://github.com/obsproject/obs-deps/releases/download/${{ env.WINDOWS_DEPS_VERSION }}/windows-deps-${{ env.WINDOWS_DEPS_VERSION }}-x64.zip -f --retry 5 -C -
+          7z x windows-deps-${{ env.WINDOWS_DEPS_VERSION }}-x64.zip -o"${{ github.workspace }}/cmbuild/deps"
+
+      - name: Configure
+        run: |
+          mkdir ./build
+          cmake -S . -B "${{ github.workspace }}/build" -G"${{ env.CMAKE_GENERATOR }}" -DCMAKE_PREFIX_PATH:PATH="${{ github.workspace }}/cmbuild/deps" -A"x64" -DCMAKE_SYSTEM_VERSION="${{ env.CMAKE_SYSTEM_VERSION }}" -DBUILD_BROWSER=false -DBUILD_VST=false -DBUILD_VIRTUALCAM=false -DBUILD_CAPTIONS=false -DCOMPILE_D3D12_HOOK=false -DENABLE_SCRIPTING=false -DDepsPath="${{ github.workspace }}/cmbuild/deps" -DDepsPath64="${{ github.workspace }}/cmbuild/deps" -DQTDIR="${{ github.workspace }}/cmbuild/deps/qt6" -DCOPIED_DEPENDENCIES=FALSE -DCOPY_DEPENDENCIES=TRUE -DENABLE_PLUGINS=TRUE -DDISABLE_PLUGINS=FALSE -DENABLE_BROWSER=FALSE -DENABLE_WEBSOCKET=FALSE
+
+      - name: Build
+        run: msbuild /m /p:Configuration=RelWithDebInfo .\build\obs-studio.sln
+
+      - name: Package (modern OBS 33 plugin layout)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = '${{ env.PLUGIN_NAME }}'
+          $bin = ".\build\rundir\RelWithDebInfo\obs-plugins\64bit"
+          $dll = Join-Path $bin "$name.dll"
+          if (-not (Test-Path $dll)) { throw "Build output $dll not found" }
+
+          $root = ".\package\$name"
+          New-Item -ItemType Directory -Force -Path "$root\data" | Out-Null
+          Copy-Item $dll $root
+          $pdb = Join-Path $bin "$name.pdb"
+          if (Test-Path $pdb) { Copy-Item $pdb $root }
+          Copy-Item -Recurse ".\plugins\$name\data\locale" "$root\data\locale"
+          Copy-Item ".\plugins\$name\LICENSE" "$root\LICENSE"
+
+          $commit = '${{ github.sha }}'
+          @"
+          Source Record for OBS Studio - Windows x64
+          Built from commit $commit of ${{ github.repository }} (branch ${{ github.ref_name }}).
+          Source Record is free software licensed under the GNU General Public License v2.0 (see LICENSE).
+          Original author: Exeldro. Source code: https://github.com/${{ github.repository }}
+
+          Installation (OBS Studio 33):
+          1. Close OBS Studio.
+          2. Remove an older installation if present:
+               <OBS folder>\obs-plugins\64bit\source-record.dll (and .pdb)
+               <OBS folder>\data\obs-plugins\source-record\
+          3. Copy the folder "$name" from this archive to
+               C:\ProgramData\obs-studio\plugins\
+             so that this file exists:
+               C:\ProgramData\obs-studio\plugins\$name\$name.dll
+          4. Start OBS Studio.
+          "@ | Set-Content -Encoding UTF8 "$root\README.txt"
+
+          Get-ChildItem -Recurse .\package | ForEach-Object { $_.FullName }
+          $hash = (Get-FileHash -Algorithm SHA256 "$root\$name.dll").Hash
+          "SHA256 $name.dll: $hash"
+          "$hash  $name/$name.dll" | Set-Content -Encoding ASCII ".\package\SHA256SUMS.txt"
+
+          $short = $commit.Substring(0, 9)
+          "ARTIFACT_NAME=$name-windows-x64-obs33-$short" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4.3.1
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: package/*
+          if-no-files-found: error
