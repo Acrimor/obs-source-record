@@ -1301,6 +1301,21 @@ static void update_encoder(struct source_record_filter_context *filter, obs_data
 	filter->audio_track_mask = audio_track_mask;
 }
 
+/* Stores the hotkeys of the replay_buffer output itself (OBS 32 and older).
+ * Since OBS 33 that output has no hotkeys and obs_hotkeys_save_output()
+ * returns NULL; keep the stored binding then instead of replacing it with
+ * null, so it can still be migrated (and is kept for older OBS versions). */
+static void save_replay_output_hotkeys(struct source_record_filter_context *filter, obs_data_t *settings)
+{
+	if (!filter->replayOutput)
+		return;
+	obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
+	if (!hotkeys)
+		return;
+	obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
+	obs_data_release(hotkeys);
+}
+
 static void source_record_filter_update(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
@@ -1447,9 +1462,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 			if (obs_source_enabled(filter->source) && filter->video_output)
 				start_replay_output(filter, settings);
 		} else if (filter->replayOutput) {
-			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
-			obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
-			obs_data_release(hotkeys);
+			save_replay_output_hotkeys(filter, settings);
 			if (filter->closing)
 				stop_output_closing(filter, &filter->replayOutput, OUTPUT_TYPE_REPLAY);
 			else
@@ -1459,9 +1472,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 		filter->replayBuffer = replay_buffer;
 	} else if (replay_buffer && filter->replayOutput && obs_source_enabled(filter->source)) {
 		if (filter->replay_buffer_duration != obs_data_get_int(settings, "replay_duration")) {
-			obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
-			obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
-			obs_data_release(hotkeys);
+			save_replay_output_hotkeys(filter, settings);
 			stop_output_async(filter, &filter->replayOutput, OUTPUT_TYPE_REPLAY);
 		}
 		obs_data_t *replay_settings = obs_output_get_settings(filter->replayOutput);
@@ -1535,11 +1546,7 @@ static void source_record_filter_update(void *data, obs_data_t *settings)
 static void source_record_filter_save(void *data, obs_data_t *settings)
 {
 	struct source_record_filter_context *filter = data;
-	if (filter->replayOutput) {
-		obs_data_t *hotkeys = obs_hotkeys_save_output(filter->replayOutput);
-		obs_data_set_obj(settings, "replay_hotkeys", hotkeys);
-		obs_data_release(hotkeys);
-	}
+	save_replay_output_hotkeys(filter, settings);
 }
 
 static void source_record_filter_defaults(obs_data_t *settings)
@@ -1905,6 +1912,34 @@ static void source_record_replay_hotkey(void *data, obs_hotkey_id id, obs_hotkey
 	obs_output_release(output);
 }
 
+/* Gives the save replay hotkey the binding that OBS 32 and older stored for
+ * the replay_buffer output's own hotkey, once, if it has no binding yet.
+ * Only on OBS 33 and newer: before that the output still has that hotkey, and
+ * the same key on both would save twice. "replay_save_hotkey_migrated" keeps
+ * a binding the user removes on purpose from coming back. */
+static void migrate_replay_hotkey(struct source_record_filter_context *context)
+{
+	if (obs_get_version() < MAKE_SEMANTIC_VERSION(33, 0, 0))
+		return;
+	obs_data_t *settings = obs_source_get_settings(context->source);
+	if (!settings)
+		return;
+	if (!obs_data_get_bool(settings, "replay_save_hotkey_migrated")) {
+		obs_data_array_t *current = obs_hotkey_save(context->replayHotkey);
+		if (!current || !obs_data_array_count(current)) {
+			obs_data_t *legacy = obs_data_get_obj(settings, "replay_hotkeys");
+			obs_data_array_t *bindings = legacy ? obs_data_get_array(legacy, "ReplayBuffer.Save") : NULL;
+			if (bindings && obs_data_array_count(bindings))
+				obs_hotkey_load(context->replayHotkey, bindings);
+			obs_data_array_release(bindings);
+			obs_data_release(legacy);
+		}
+		obs_data_array_release(current);
+		obs_data_set_bool(settings, "replay_save_hotkey_migrated", true);
+	}
+	obs_data_release(settings);
+}
+
 static void source_record_filter_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -1943,10 +1978,13 @@ static void source_record_filter_tick(void *data, float seconds)
 								    obs_frontend_get_locale_string("Basic.Main.AddChapterMarker"),
 								    source_record_chapter_hotkey, context);
 
-	if (context->replayHotkey == OBS_INVALID_HOTKEY_ID)
+	if (context->replayHotkey == OBS_INVALID_HOTKEY_ID) {
 		context->replayHotkey = obs_hotkey_register_source(parent, "source_record.SaveReplay",
 								   obs_frontend_get_locale_string("Basic.Main.SaveReplay"),
 								   source_record_replay_hotkey, context);
+		if (context->replayHotkey != OBS_INVALID_HOTKEY_ID)
+			migrate_replay_hotkey(context);
+	}
 
 
 	uint32_t width = obs_source_get_width(parent);
