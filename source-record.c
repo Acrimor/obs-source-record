@@ -63,6 +63,7 @@ struct source_record_filter_context {
 	obs_weak_source_t *audio_source;
 	bool closing;
 	bool exiting;
+	bool shutdown;
 	long long replay_buffer_duration;
 	bool remove_after_record;
 	long long record_max_seconds;
@@ -1588,6 +1589,77 @@ static void update_task(void *param)
 	obs_source_update(context->source, NULL);
 }
 
+static void frontend_event(enum obs_frontend_event event, void *data);
+
+/* Runs on the graphics thread, so it cannot race with video_tick or a deferred
+ * update: hands all outputs to the stop threads and keeps them from being
+ * started again. */
+static void shutdown_outputs_task(void *param)
+{
+	struct source_record_filter_context *context = param;
+	context->closing = true;
+	context->record = false;
+	context->stream = false;
+	context->replayBuffer = false;
+	if (context->fileOutput)
+		stop_output_closing(context, &context->fileOutput, OUTPUT_TYPE_FILE);
+	if (context->streamOutput)
+		stop_output_closing(context, &context->streamOutput, OUTPUT_TYPE_STREAM);
+	if (context->replayOutput)
+		stop_output_closing(context, &context->replayOutput, OUTPUT_TYPE_REPLAY);
+}
+
+/* Called on the UI thread for OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN (the first
+ * event when OBS exits, before the scene data is cleared) and for
+ * OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP.
+ *
+ * Stops the outputs while video and audio are still running: a replay buffer
+ * can only finish stopping while its encoder still receives frames. Then it
+ * releases the references the private view holds on the parent source. The
+ * view keeping the parent alive otherwise means the filter is only freed once
+ * libobs happens to render the view again, or, if that does not happen in
+ * time, only inside obs_shutdown() after video and audio have been stopped,
+ * with its outputs still running.
+ *
+ * The context must not be used after this returns: releasing the view's
+ * references may release the last references to the parent and this filter. */
+static void source_record_shutdown(struct source_record_filter_context *context)
+{
+	if (context->shutdown)
+		return;
+	context->shutdown = true;
+
+	obs_source_t *self = obs_source_get_ref(context->source);
+	if (!self)
+		return;
+
+	if (obs_get_video() && !obs_in_task_thread(OBS_TASK_GRAPHICS))
+		obs_queue_task(OBS_TASK_GRAPHICS, shutdown_outputs_task, context, true);
+	else
+		shutdown_outputs_task(context);
+
+	/* The stop threads give up after 10 seconds; do not wait longer. */
+	const uint64_t start_time = os_gettime_ns();
+	while (os_atomic_load_long(&context->active_stop_threads) > 0) {
+		if (os_gettime_ns() - start_time > 11000000000ULL) {
+			blog(LOG_WARNING, "Source Record: outputs of '%s' did not stop before closing",
+			     obs_source_get_name(context->source));
+			break;
+		}
+		os_sleep_ms(10);
+	}
+
+	/* Removing the callback that is being called is safe: the frontend
+	 * iterates the callbacks backwards by index. */
+	obs_frontend_remove_event_callback(frontend_event, context);
+
+	if (context->view) {
+		obs_view_set_source(context->view, SOURCE_CHANNEL, NULL);
+		obs_view_set_source(context->view, BACKGROUND_CHANNEL, NULL);
+	}
+	obs_source_release(self);
+}
+
 static void frontend_event(enum obs_frontend_event event, void *data)
 {
 	struct source_record_filter_context *context = data;
@@ -1601,12 +1673,10 @@ static void frontend_event(enum obs_frontend_event event, void *data)
 
 		obs_queue_task(OBS_TASK_GRAPHICS, update_task, data, false);
 	} else if (event == OBS_FRONTEND_EVENT_EXIT || event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN) {
-		context->closing = true;
 		context->exiting = true;
-		obs_source_update(context->source, NULL);
+		source_record_shutdown(context);
 	} else if (event == OBS_FRONTEND_EVENT_SCENE_COLLECTION_CLEANUP) {
-		context->closing = true;
-		obs_source_update(context->source, NULL);
+		source_record_shutdown(context);
 	}
 }
 
